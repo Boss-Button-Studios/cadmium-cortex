@@ -1,0 +1,26 @@
+{
+    "c5b9fc1732746d7947feeb73d23b2f97f2fb54a16ca6f1fc3c10f230af09dd66": {
+        "device_id": "c5b9fc1732746d7947feeb73d23b2f97f2fb54a16ca6f1fc3c10f230af09dd66",
+        "vendor": "Synology Incorporated",
+        "classification_confidence": "low",
+        "first_seen": "2026-03-27T04:22:49.382756",
+        "observed_ips": [
+            "192.168.0.1"
+        ],
+        "interface": "wlp3s0",
+        "trust_tier": "pending",
+        "last_seen": "2026-03-27T04:22:49.382781"
+    },
+    "460c3ac02c0a09022858104fa69d0762c838413dbafd52b6348086266c98c863": {
+        "device_id": "460c3ac02c0a09022858104fa69d0762c838413dbafd52b6348086266c98c863",
+        "vendor": "Unknown",
+        "classification_confidence": "low",
+        "first_seen": "2026-03-27T04:22:49.382789",
+        "observed_ips": [
+            "192.168.0.196"
+        ],
+        "interface": "wlp3s0",
+        "trust_tier": "pending",
+        "last_seen": "2026-03-27T04:22:49.382798"
+    }
+}

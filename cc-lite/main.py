@@ -1,7 +1,7 @@
 import uuid
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from cortex_lite.config import CadmiumTheme as ct
 from cortex_lite.census.arp_reader import get_arp_table
 from cortex_lite.census.oui_lookup import OUILookup
@@ -13,7 +13,7 @@ from cortex_lite.auditor.auditor_general import AuditorGeneral
 CONFIG = {
     "admin_mac": "00:e0:4c:36:62:b8",  # CHANGE THIS to your actual MAC
     "gateway_ip": "192.168.0.1",       # CHANGE THIS to your router IP
-    "model": "phi4-mini",
+    "model": "qwen2.5-coder:1.5b",
     "log_path": "audit/audit.jsonl"
 }
 
@@ -21,7 +21,7 @@ def log_event(event_type, agent, branch, payload, articles=None):
     """Writes a Section 9 compliant record to the JSONL log."""
     record = {
         "event_id": str(uuid.uuid4()),
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "agent": agent,
         "branch": branch,
         "event_type": event_type,
