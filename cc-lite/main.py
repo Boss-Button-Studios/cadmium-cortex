@@ -11,7 +11,7 @@ from cortex_lite.auditor.auditor_general import AuditorGeneral
 
 # --- CONFIGURATION (Tonight's Defaults) ---
 CONFIG = {
-    "admin_mac": "00:e0:4c:36:62:b8",  # CHANGE THIS to your actual MAC
+    "admin_mac": "90:09:d0:51:ed:f0",  # CHANGE THIS to your actual MAC
     "gateway_ip": "192.168.0.1",       # CHANGE THIS to your router IP
     "model": "qwen2.5-coder:1.5b",
     "log_path": "audit/audit.jsonl"
