@@ -2,3 +2,4 @@ cc-lite/audit/
 cc-lite/data/registry.json
 **/__pycache__/
 *.pyc
+.idea/
