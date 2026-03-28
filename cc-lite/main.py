@@ -9,12 +9,44 @@ from cortex_lite.auditor.constitution_loader import load_constitution
 from cortex_lite.auditor.auditor_general import AuditorGeneral
 from cortex_lite.utils.reporter import summarize_session
 
+import threading
+import itertools
+import sys
+import time
+
+class Spinner:
+    def __init__(self, message):
+        self.message = message
+        self._spinning = False
+        self._thread = None
+
+    def __enter__(self):
+        self._spinning = True
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def _spin(self):
+        for char in itertools.cycle('|/-\\'):
+            if not self._spinning:
+                break
+            sys.stderr.write(f'\r{self.message} {char}')
+            sys.stderr.flush()
+            time.sleep(0.1)
+
+    def __exit__(self, *args):
+        self._spinning = False
+        self._thread.join()
+        sys.stderr.write('\r' + ' ' * (len(self.message) + 4) + '\r')
+        sys.stderr.flush()
+
+
 # --- CONFIGURATION ---
 CONFIG = {
     "admin_mac": "90:09:d0:51:ed:f0",  
     "gateway_ip": "192.168.0.1",       
     "auditor_ip": "192.168.0.5",       
-    "model": "qwen2.5-coder:1.5b",
+    "model": "llama3.2:3b",
     "log_path": "audit/audit.jsonl"
 }
 
@@ -93,29 +125,28 @@ def main():
         
         for i in range(0, len(registry_summary), batch_size):
             batch = registry_summary[i : i + batch_size]
-            print(ct.paint(f"    > Deliberating on batch {i//batch_size + 1} ({len(batch)} devices)...", ct.YELLOW))
-            
+            batch_num = i // batch_size + 1
+            total_batches = -(-len(registry_summary) // batch_size)  # ceiling division
+    
+            msg = ct.paint(f"    > Batch {batch_num}/{total_batches} ({len(batch)} devices)", ct.YELLOW)
+    
             try:
-                # Force a small "rest" for the Ollama substrate
-                os.system("sleep 1") 
-                
-                batch_findings = auditor_instance.audit(
-                    batch, 
-                    gateway_ip=CONFIG["gateway_ip"], 
-                    admin_id=CONFIG["admin_mac"]
-                )
-                
+                os.system("sleep 1")
+                with Spinner(msg):
+                    batch_findings = auditor_instance.audit(
+                        batch,
+                        gateway_ip=CONFIG["gateway_ip"],
+                        admin_id=CONFIG["admin_mac"]
+                    )
+        
                 if batch_findings:
-                    print(ct.paint(f"      [+] Batch success: {len(batch_findings)} findings.", ct.GREEN))
+                    print(ct.paint(f"      [+] {len(batch_findings)} findings.", ct.GREEN))
                     all_findings.extend(batch_findings)
                 else:
-                    print(f"      [-] Batch complete: No violations found.")
-                    
-            except Exception as e:
-                print(ct.paint(f"    [!] Batch {i//batch_size + 1} Failed: {e}", ct.RED))
-                # If a 500 occurs, Ollama sometimes needs a kick
-                os.system("ollama serve &")
+                    print(f"      [-] No violations.")
 
+            except Exception as e:
+                print(ct.paint(f"    [!] Batch {batch_num} failed: {e}", ct.RED))
         # Log all findings to your JSONL
         for finding in all_findings:
             log_event(
@@ -133,6 +164,7 @@ def main():
     finally:
         # 4. Reporting
         summarize_session(CONFIG["log_path"], current_session)
+        print(f"SESSION_ID={current_session}")
 
 if __name__ == "__main__":
     main()
