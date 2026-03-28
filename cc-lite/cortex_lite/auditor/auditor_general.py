@@ -52,12 +52,10 @@ Device list:
             "model": self.model,
             "messages": [
                 {"role": "system", "content": self._build_system_prompt()},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": f"Gateway: {gateway_ip}\nAdmin: {admin_id}\nDevices: {json.dumps(registry_summary)}"}
             ],
             "stream": False,
-            "options": {
-                "temperature": 0.0
-            }
+            "format": "json" # Forces the model to output valid JSON
         }
 
         try:

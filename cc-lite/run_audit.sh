@@ -1,5 +1,8 @@
 #!/bin/bash
 
+#Clear old Python compiled files
+find . -name "__pycache__" -type d -exec rm -rf {} +
+
 # --- CONFIGURATION ---
 LOG_FILE="audit/audit.jsonl"
 ROUTER_IP="192.168.0.1"

@@ -3,7 +3,7 @@ import re
 import logging
 
 
-def get_arp_table() -> list[dict]:
+def get_arp_table(interface="wlp3s0"):
     """Reads the local ARP cache without requiring root privileges."""
     devices = []
 

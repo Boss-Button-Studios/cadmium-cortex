@@ -5,22 +5,20 @@ import subprocess
 from datetime import datetime, timezone
 from cortex_lite.config import CadmiumTheme as ct
 from cortex_lite.census.arp_reader import get_arp_table
-from cortex_lite.census.oui_lookup import OUILookup
-from cortex_lite.census.registry import DeviceRegistry
 from cortex_lite.auditor.constitution_loader import load_constitution
 from cortex_lite.auditor.auditor_general import AuditorGeneral
 from cortex_lite.utils.reporter import summarize_session
 
-# --- CONFIGURATION (Tonight's Defaults) ---
+# --- CONFIGURATION ---
 CONFIG = {
-    "admin_mac": "90:09:d0:51:ed:f0",  # CHANGE THIS to your actual MAC
-    "gateway_ip": "68.72.96.95",       # CHANGE THIS to your router IP
-    "auditor_ip": "192.168.0.5"
+    "admin_mac": "90:09:d0:51:ed:f0",  
+    "gateway_ip": "192.168.0.1",       
+    "auditor_ip": "192.168.0.5",       
     "model": "qwen2.5-coder:1.5b",
     "log_path": "audit/audit.jsonl"
 }
 
-def log_event(event_type, agent, branch, payload, articles=None):
+def log_event(event_type, agent, branch, payload, session_id, articles=None):
     """Writes a Section 9 compliant record to the JSONL log."""
     record = {
         "event_id": str(uuid.uuid4()),
@@ -28,10 +26,11 @@ def log_event(event_type, agent, branch, payload, articles=None):
         "agent": agent,
         "branch": branch,
         "event_type": event_type,
-        "session_id": SESSION_ID,
+        "session_id": session_id,
         "articles_touched": articles or [],
         "payload": payload
     }
+    os.makedirs(os.path.dirname(CONFIG["log_path"]), exist_ok=True)
     with open(CONFIG["log_path"], "a") as f:
         f.write(json.dumps(record) + "\n")
 
@@ -41,55 +40,99 @@ class CensusTaker:
         self.gateway_ip = gateway_ip
 
     def active_survey(self):
-        """
-        Forces all 254 potential IPs to respond, 
-        populating the ARP table for the Auditor.
-        """
+        """Forces hidden devices in the other building to appear."""
         print(ct.paint(f"[*] Surveying building-to-building bridge...", ct.YELLOW))
-        
-        # Extract the subnet (e.g., 192.168.0)
         subnet = ".".join(self.gateway_ip.split('.')[:-1])
-        
-        # Parallel ping sweep (Linux/Bash style)
+        processes = []
         for i in range(1, 255):
             target = f"{subnet}.{i}"
-            # Launch in background (&) to keep it fast
-            subprocess.Popen(
+            p = subprocess.Popen(
                 ["ping", "-c", "1", "-W", "1", target],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-        
-        # Give the network a second to settle
+            processes.append(p)
+        for p in processes:
+            p.wait()
         os.system("sleep 2")
 
-    def collect(self):
-        """
-        This is where your existing logic to read 
-        /proc/net/arp or 'ip neigh' would go.
-        """
-        # (Your existing collection logic here)
-        pass
-
 def main():
-    # Now local - unique per run
-    session_id = str(uuid.uuid4()) 
+    current_session = str(uuid.uuid4()) 
 
     print(ct.paint(f"\n{ct.BOLD}CADMIUM CORTEX -- Constitutional Audit", ct.BLUE))
-    print(ct.paint(f"Session: {session_id}\n", ct.BLUE))
+    print(ct.paint(f"Session: {current_session}\n", ct.BLUE))
 
-    # 1. Initialize the Census Taker
-    census = CensusTaker(interface="wlp3s0", gateway_ip="192.168.0.1")
-
-    # 2. Perform Active Survey (Find those 4 hidden IoT devices)
+    census = CensusTaker(interface="wlp3s0", gateway_ip=CONFIG["gateway_ip"])
     census.active_survey()
 
-    # 3. Load Constitution & Run Audit
     try:
+        # 1. Legislative: Load Constitution
         const_text = load_constitution()
-        # ... your existing logic ...
+        print(ct.paint("[-] Constitution loaded and versioned.", ct.GREEN))
+
+        # 2. Legislative: Census Collection
+        raw_devices = get_arp_table(interface=census.interface)
+        print(ct.paint(f"[-] Census captured {len(raw_devices)} devices.", ct.GREEN))
         
+        # --- 3. JUDICIAL DELIBERATION ---
+        auditor_instance = AuditorGeneral(CONFIG["model"], const_text)
+        
+        registry_summary = []
+        for d in raw_devices:
+            registry_summary.append({
+                "device_id": d['mac'].replace(':', ''), 
+                "ip": d['ip'],
+                "mac": d['mac'],
+                "vendor": "Unknown"
+            })
+
+        print(ct.paint(f"[*] Auditor deliberating on {len(registry_summary)} devices...", ct.YELLOW))
+        
+        # High-stability batching
+        batch_size = 4  # Dropped to 4 for stability
+        all_findings = []
+        
+        for i in range(0, len(registry_summary), batch_size):
+            batch = registry_summary[i : i + batch_size]
+            print(ct.paint(f"    > Deliberating on batch {i//batch_size + 1} ({len(batch)} devices)...", ct.YELLOW))
+            
+            try:
+                # Force a small "rest" for the Ollama substrate
+                os.system("sleep 1") 
+                
+                batch_findings = auditor_instance.audit(
+                    batch, 
+                    gateway_ip=CONFIG["gateway_ip"], 
+                    admin_id=CONFIG["admin_mac"]
+                )
+                
+                if batch_findings:
+                    print(ct.paint(f"      [+] Batch success: {len(batch_findings)} findings.", ct.GREEN))
+                    all_findings.extend(batch_findings)
+                else:
+                    print(f"      [-] Batch complete: No violations found.")
+                    
+            except Exception as e:
+                print(ct.paint(f"    [!] Batch {i//batch_size + 1} Failed: {e}", ct.RED))
+                # If a 500 occurs, Ollama sometimes needs a kick
+                os.system("ollama serve &")
+
+        # Log all findings to your JSONL
+        for finding in all_findings:
+            log_event(
+                event_type="accusation",
+                agent="auditor_general",
+                branch="judicial",
+                payload=finding,
+                session_id=current_session,
+                articles=[finding.get("article", "Unknown")]
+            )
+
+    except Exception as e:
+        print(ct.paint(f"[!] Critical Substrate Failure: {e}", ct.RED))
+    
     finally:
-        # 4. Use the local session_id for the summary
-        summarize_session("audit/audit.jsonl", session_id)
+        # 4. Reporting
+        summarize_session(CONFIG["log_path"], current_session)
+
 if __name__ == "__main__":
     main()
