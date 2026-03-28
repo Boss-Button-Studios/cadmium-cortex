@@ -1,6 +1,7 @@
 import uuid
 import json
 import os
+import subprocess
 from datetime import datetime, timezone
 from cortex_lite.config import CadmiumTheme as ct
 from cortex_lite.census.arp_reader import get_arp_table
@@ -8,11 +9,13 @@ from cortex_lite.census.oui_lookup import OUILookup
 from cortex_lite.census.registry import DeviceRegistry
 from cortex_lite.auditor.constitution_loader import load_constitution
 from cortex_lite.auditor.auditor_general import AuditorGeneral
+from cortex_lite.utils.reporter import summarize_session
 
 # --- CONFIGURATION (Tonight's Defaults) ---
 CONFIG = {
     "admin_mac": "90:09:d0:51:ed:f0",  # CHANGE THIS to your actual MAC
-    "gateway_ip": "192.168.0.1",       # CHANGE THIS to your router IP
+    "gateway_ip": "68.72.96.95",       # CHANGE THIS to your router IP
+    "auditor_ip": "192.168.0.5"
     "model": "qwen2.5-coder:1.5b",
     "log_path": "audit/audit.jsonl"
 }
@@ -32,63 +35,61 @@ def log_event(event_type, agent, branch, payload, articles=None):
     with open(CONFIG["log_path"], "a") as f:
         f.write(json.dumps(record) + "\n")
 
-SESSION_ID = str(uuid.uuid4())
+class CensusTaker:
+    def __init__(self, interface="wlp3s0", gateway_ip="192.168.0.1"):
+        self.interface = interface
+        self.gateway_ip = gateway_ip
+
+    def active_survey(self):
+        """
+        Forces all 254 potential IPs to respond, 
+        populating the ARP table for the Auditor.
+        """
+        print(ct.paint(f"[*] Surveying building-to-building bridge...", ct.YELLOW))
+        
+        # Extract the subnet (e.g., 192.168.0)
+        subnet = ".".join(self.gateway_ip.split('.')[:-1])
+        
+        # Parallel ping sweep (Linux/Bash style)
+        for i in range(1, 255):
+            target = f"{subnet}.{i}"
+            # Launch in background (&) to keep it fast
+            subprocess.Popen(
+                ["ping", "-c", "1", "-W", "1", target],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        
+        # Give the network a second to settle
+        os.system("sleep 2")
+
+    def collect(self):
+        """
+        This is where your existing logic to read 
+        /proc/net/arp or 'ip neigh' would go.
+        """
+        # (Your existing collection logic here)
+        pass
 
 def main():
-    print(ct.paint(f"\n{ct.BOLD}CADMIUM CORTEX -- Constitutional Audit", ct.BLUE))
-    print(ct.paint(f"Session: {SESSION_ID}\n", ct.BLUE))
+    # Now local - unique per run
+    session_id = str(uuid.uuid4()) 
 
-    # 1. Load Constitution
+    print(ct.paint(f"\n{ct.BOLD}CADMIUM CORTEX -- Constitutional Audit", ct.BLUE))
+    print(ct.paint(f"Session: {session_id}\n", ct.BLUE))
+
+    # 1. Initialize the Census Taker
+    census = CensusTaker(interface="wlp3s0", gateway_ip="192.168.0.1")
+
+    # 2. Perform Active Survey (Find those 4 hidden IoT devices)
+    census.active_survey()
+
+    # 3. Load Constitution & Run Audit
     try:
         const_text = load_constitution()
-        print(ct.paint("[-] Constitution loaded and versioned.", ct.GREEN))
-    except Exception as e:
-        print(ct.paint(f"[!] Constitutional Error: {e}", ct.RED))
-        return
-
-    # 2. Census Taker
-    print(ct.paint("[-] Starting Census Taker (ARP scan)...", ct.YELLOW))
-    raw_devices = get_arp_table()
-    oui = OUILookup()
-    registry = DeviceRegistry()
-    
-    new_count = registry.update_devices(raw_devices, oui)
-    
-    # Log observations
-    for dev_id, data in registry.devices.items():
-        log_event("observation", "census_taker", "legislative", data)
-
-    print(ct.paint(f"[-] Census: {len(raw_devices)} devices observed ({new_count} new).", ct.GREEN))
-
-    # 3. Auditor General
-    print(ct.paint(f"[-] Running Audit via {CONFIG['model']}...", ct.YELLOW))
-    auditor = AuditorGeneral(CONFIG["model"], const_text)
-    
-    # We hash the admin MAC for the auditor's context
-    admin_id = registry._hash_mac(CONFIG["admin_mac"])
-    summary = registry.get_audit_summary()
-    
-    findings = auditor.audit(summary, CONFIG["gateway_ip"], admin_id)
-
-    # 4. Results & Logging
-    if not findings:
-        print(ct.paint("[-] No constitutional concerns identified.", ct.GREEN))
-    else:
-        print(ct.paint(f"[!] {len(findings)} potential concerns found:", ct.ORANGE))
-        for f in findings:
-            color = ct.RED if f['suspicion_level'] == 'high' else ct.ORANGE
-            print(ct.paint(f"  • Article {f['article']} [{f['suspicion_level'].upper()}]", color))
-            print(f"    Device: {f['device_id'][:12]}... ({f['evidence']})")
-            
-            log_event(
-                "accusation", 
-                "auditor_general", 
-                "judicial", 
-                f, 
-                articles=[f['article']]
-            )
-
-    print(ct.paint(f"\nAudit log updated: {CONFIG['log_path']}", ct.BLUE))
-
+        # ... your existing logic ...
+        
+    finally:
+        # 4. Use the local session_id for the summary
+        summarize_session("audit/audit.jsonl", session_id)
 if __name__ == "__main__":
     main()
