@@ -8,6 +8,7 @@ from cortex_lite.census.arp_reader import get_arp_table
 from cortex_lite.auditor.constitution_loader import load_constitution
 from cortex_lite.auditor.auditor_general import AuditorGeneral
 from cortex_lite.utils.reporter import summarize_session
+from cortex_lite.census.mdns_listener import scan as mdns_scan
 
 import threading
 import itertools
@@ -103,6 +104,9 @@ def main():
 
         # 2. Legislative: Census Collection
         raw_devices = get_arp_table(interface=census.interface)
+        print(ct.paint("[*] Running mDNS scan...", ct.YELLOW))
+        mdns_data = mdns_scan(listen_seconds=10)
+        print(ct.paint(f"[-] mDNS returned {len(mdns_data)} device(s).", ct.GREEN))
         print(ct.paint(f"[-] Census captured {len(raw_devices)} devices.", ct.GREEN))
         
         # --- 3. JUDICIAL DELIBERATION ---
@@ -110,12 +114,15 @@ def main():
         
         registry_summary = []
         for d in raw_devices:
+            mdns_info = mdns_data.get(d['ip'], {})
             registry_summary.append({
-                "device_id": d['mac'].replace(':', ''), 
-                "ip": d['ip'],
-                "mac": d['mac'],
-                "vendor": "Unknown"
-            })
+            "device_id": d['mac'].replace(':', ''),
+            "ip": d['ip'],
+            "mac": d['mac'],
+            "vendor": "Unknown",
+            "hostname": mdns_info.get("hostname"),
+            "services": mdns_info.get("services", []),
+    })
 
         print(ct.paint(f"[*] Auditor deliberating on {len(registry_summary)} devices...", ct.YELLOW))
         
