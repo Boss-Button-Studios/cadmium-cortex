@@ -235,8 +235,21 @@ def main():
             mdns_count=len(mdns_data),
             all_findings=all_findings,
             rejected_count=total_rejected,
-            error_count=total_errors
-        )
+            error_count=total_errors,
+            total_tokens=sum(
+                b.get("tokens", {}).get("total_tokens", 0) for b in batch_records
+        ),
+        tokens_per_finding=(
+            round(sum(b.get("tokens", {}).get("total_tokens", 0)
+                for b in batch_records) / len(all_findings), 1)
+            if all_findings else None
+        ),
+        seconds_per_finding=(
+            round(sum(b.get("duration_seconds", 0)
+            for b in batch_records) / len(all_findings), 2)
+            if all_findings else None
+        ),
+)
 
         print(ct.paint(f"[-] Research log: {research_path}", ct.GREEN))
         print(ct.paint(f"[-] Summary:      {summary_path}", ct.GREEN))

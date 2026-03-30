@@ -4,13 +4,15 @@ CC-Lite Audit Log Extractor
 ============================
 Walks a directory tree and produces two CSV files:
 
-  sessions.csv  — one row per session: aggregate metrics + hardware/config context
+  sessions.csv  — one row per session: aggregate metrics, hardware/config,
+                  token counts, and efficiency metrics
   findings.csv  — one row per finding: full detail for qualitative analysis
 
 Handles two source formats automatically:
 
   research_*.json   — rich per-session format (primary; preferred for analysis)
-                      includes hardware, config, timing, rejected findings, raw reply
+                      includes hardware, config, timing, token counts, rejected
+                      findings, and pre-computed efficiency metrics
   audit.jsonl       — operational Section 9 log (fallback; used if no research
                       JSON files are found in a folder)
 
@@ -19,7 +21,6 @@ Organise runs as condition subfolders — the folder name becomes the condition 
   data/
     baseline/
       research_2026-03-29T00-01-54.json
-      research_2026-03-29T01-14-22.json
     temperature_0.2/
       research_2026-03-29T02-30-00.json
     mininet_scenario_A/
@@ -53,10 +54,6 @@ SUSPICION_LEVELS = ["low", "medium", "high"]
 # --- Ground truth -------------------------------------------------------------
 
 def load_ground_truth(folder: str):
-    """
-    Load ground_truth.json from a condition folder.
-    Returns a set of (device_id_hex, article) tuples, or None if absent.
-    """
     gt_path = os.path.join(folder, "ground_truth.json")
     if not os.path.exists(gt_path):
         return None
@@ -70,16 +67,7 @@ def load_ground_truth(folder: str):
 # --- File discovery -----------------------------------------------------------
 
 def find_source_files(root: str) -> list:
-    """
-    Walk root and return list of:
-        (condition_label, folder_path, file_path, format)
-    where format is "research" or "jsonl".
-
-    Research JSON files take priority per folder — if any are present the
-    folder's audit.jsonl is skipped.
-    """
     by_folder = defaultdict(lambda: {"research": [], "jsonl": []})
-
     for dirpath, _, filenames in os.walk(root):
         for fname in filenames:
             fpath = os.path.join(dirpath, fname)
@@ -90,46 +78,39 @@ def find_source_files(root: str) -> list:
 
     results = []
     for dirpath, files in sorted(by_folder.items()):
-        rel = os.path.relpath(dirpath, root)
+        rel       = os.path.relpath(dirpath, root)
         condition = rel if rel != "." else "root"
-
         if files["research"]:
             for fpath in sorted(files["research"]):
                 results.append((condition, dirpath, fpath, "research"))
         elif files["jsonl"]:
             for fpath in sorted(files["jsonl"]):
                 results.append((condition, dirpath, fpath, "jsonl"))
-
     return results
 
-# --- Ground truth evaluation --------------------------------------------------
+# --- Shared helpers -----------------------------------------------------------
 
 def evaluate_ground_truth(finding_rows: list, ground_truth) -> tuple:
-    """Tag findings with TP/FP and return (tp, fp, fn) counts."""
     if ground_truth is None:
         return "", "", ""
-
-    true_positives  = 0
-    false_positives = 0
-    found_violations = set()
-
+    tp = 0
+    fp = 0
+    found = set()
     for f in finding_rows:
         did = f["device_id"].replace(":", "").lower()
         art = f["article"].strip().upper()
         if (did, art) in ground_truth:
-            true_positives += 1
-            found_violations.add((did, art))
+            tp += 1
+            found.add((did, art))
             f["is_true_positive"]  = True
             f["is_false_positive"] = False
         else:
-            false_positives += 1
+            fp += 1
             f["is_true_positive"]  = False
             f["is_false_positive"] = True
+    fn = len(ground_truth - found)
+    return tp, fp, fn
 
-    false_negatives = len(ground_truth - found_violations)
-    return true_positives, false_positives, false_negatives
-
-# --- Article / suspicion counts ----------------------------------------------
 
 def count_findings(finding_rows: list) -> tuple:
     article_counts   = {f"findings_article_{a}": 0 for a in ARTICLES}
@@ -146,7 +127,6 @@ def count_findings(finding_rows: list) -> tuple:
 # --- Research JSON extraction -------------------------------------------------
 
 def extract_research_json(file_path: str, condition: str, ground_truth) -> tuple:
-    """Extract one research_*.json -> (session_rows, finding_rows)."""
     with open(file_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -181,24 +161,38 @@ def extract_research_json(file_path: str, condition: str, ground_truth) -> tuple
         "condition":               condition,
         "source_file":             os.path.basename(file_path),
         "timestamp":               timestamp,
+        # Hardware
         "platform":                hw.get("platform", ""),
         "python_version":          hw.get("python_version", ""),
         "cpu_cores":               hw.get("cpu_cores", ""),
         "ram_gb":                  hw.get("ram_gb", ""),
+        # Config
         "model":                   cfg.get("model", ""),
         "temperature":             cfg.get("temperature", ""),
         "num_ctx":                 cfg.get("num_ctx", ""),
         "num_gpu":                 cfg.get("num_gpu", ""),
         "batch_size":              cfg.get("batch_size", ""),
+        # Census
         "device_count":            census.get("device_count", ""),
         "mdns_responses":          census.get("mdns_responses", ""),
+        # Run summary
         "total_batches":           summary.get("total_batches", ""),
         "total_valid_findings":    summary.get("total_valid_findings", ""),
         "total_rejected_findings": summary.get("total_rejected_findings", ""),
         "total_errors":            summary.get("total_errors", ""),
         "total_inference_seconds": summary.get("total_inference_seconds", ""),
+        # Token counts
+        "total_prompt_tokens":     summary.get("total_prompt_tokens", ""),
+        "total_completion_tokens": summary.get("total_completion_tokens", ""),
+        "total_tokens":            summary.get("total_tokens", ""),
+        # Efficiency metrics
+        "tokens_per_finding":      summary.get("tokens_per_finding", ""),
+        "seconds_per_finding":     summary.get("seconds_per_finding", ""),
+        "rejection_rate":          summary.get("rejection_rate", ""),
+        # Finding breakdowns
         **article_counts,
         **suspicion_counts,
+        # Ground truth
         "true_positives":          tp,
         "false_positives":         fp,
         "false_negatives":         fn,
@@ -209,7 +203,6 @@ def extract_research_json(file_path: str, condition: str, ground_truth) -> tuple
 # --- JSONL fallback extraction ------------------------------------------------
 
 def iter_jsonl(path: str):
-    """Yield parsed JSON objects from a JSONL file, skipping malformed lines."""
     with open(path, "r", encoding="utf-8") as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
@@ -223,31 +216,26 @@ def iter_jsonl(path: str):
 
 
 def extract_jsonl(file_path: str, condition: str, ground_truth) -> tuple:
-    """Extract one audit.jsonl -> (session_rows, finding_rows)."""
-    sessions = {}
+    sessions            = {}
     findings_by_session = defaultdict(list)
 
     for event in iter_jsonl(file_path):
         sid = event.get("session_id")
         if not sid:
             continue
-
         if sid not in sessions:
             sessions[sid] = {
-                "session_id":  sid,
-                "condition":   condition,
-                "source_file": os.path.basename(file_path),
-                "timestamp":   event.get("timestamp", ""),
+                "session_id":   sid,
+                "condition":    condition,
+                "source_file":  os.path.basename(file_path),
+                "timestamp":    event.get("timestamp", ""),
                 "device_count": 0,
             }
-
         ts = event.get("timestamp", "")
         if ts and ts < sessions[sid]["timestamp"]:
             sessions[sid]["timestamp"] = ts
-
         if event.get("event_type") == "observation":
             sessions[sid]["device_count"] += 1
-
         if (event.get("agent") == "auditor_general" and
                 event.get("event_type") == "accusation"):
             payload = event.get("payload", {})
@@ -273,6 +261,7 @@ def extract_jsonl(file_path: str, condition: str, ground_truth) -> tuple:
         article_counts, suspicion_counts = count_findings(flist)
         tp, fp, fn = evaluate_ground_truth(flist, ground_truth)
 
+        # Token columns blank for JSONL — not captured in that format
         session_rows.append({
             "session_id":              sid,
             "condition":               condition,
@@ -294,6 +283,12 @@ def extract_jsonl(file_path: str, condition: str, ground_truth) -> tuple:
             "total_rejected_findings": "",
             "total_errors":            "",
             "total_inference_seconds": "",
+            "total_prompt_tokens":     "",
+            "total_completion_tokens": "",
+            "total_tokens":            "",
+            "tokens_per_finding":      "",
+            "seconds_per_finding":     "",
+            "rejection_rate":          "",
             **article_counts,
             **suspicion_counts,
             "true_positives":          tp,
@@ -308,13 +303,23 @@ def extract_jsonl(file_path: str, condition: str, ground_truth) -> tuple:
 
 SESSION_FIELDS = [
     "session_id", "condition", "source_file", "timestamp",
+    # Hardware
     "platform", "python_version", "cpu_cores", "ram_gb",
+    # Config
     "model", "temperature", "num_ctx", "num_gpu", "batch_size",
+    # Census
     "device_count", "mdns_responses",
+    # Run summary
     "total_batches", "total_valid_findings", "total_rejected_findings",
     "total_errors", "total_inference_seconds",
+    # Tokens
+    "total_prompt_tokens", "total_completion_tokens", "total_tokens",
+    # Efficiency
+    "tokens_per_finding", "seconds_per_finding", "rejection_rate",
+    # Finding breakdowns
     *[f"findings_article_{a}" for a in ARTICLES],
     *[f"findings_{s}" for s in SUSPICION_LEVELS],
+    # Ground truth
     "true_positives", "false_positives", "false_negatives",
 ]
 
@@ -340,7 +345,7 @@ def main():
         description="Extract CC-Lite audit results to CSV for analysis."
     )
     parser.add_argument("root_dir",
-                        help="Root directory containing condition subfolders and/or source files")
+                        help="Root directory containing condition subfolders")
     parser.add_argument("--out", default=None,
                         help="Output directory for CSV files (default: root_dir)")
     args = parser.parse_args()

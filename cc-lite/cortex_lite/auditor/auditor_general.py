@@ -60,11 +60,12 @@ CONSTITUTIONAL ARTICLES:
     def audit(self, registry_summary: list, gateway_ip: str, admin_id: str) -> dict:
         """
         Returns a dict containing:
-          - valid_findings: list of validated finding dicts
-          - rejected_findings: list of dicts with 'finding' and 'reason'
-          - raw_reply: the raw string from the model
-          - duration_seconds: float
-          - error: string or None
+          - valid_findings:     list of validated finding dicts
+          - rejected_findings:  list of dicts with 'finding' and 'reason'
+          - raw_reply:          the raw string from the model
+          - tokens:             dict with prompt_tokens, completion_tokens, total_tokens
+          - duration_seconds:   float
+          - error:              string or None
         """
         user_prompt = f"""Network observation summary:
 - Gateway IP: {gateway_ip}
@@ -82,13 +83,15 @@ Device list:
             ],
             "stream": False,
             "options": {
-                "num_ctx": 2048,
-                "num_gpu": 0,
+                "num_ctx":     2048,
+                "num_gpu":     0,
                 "temperature": 0.2
             }
         }
 
+        empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         t0 = time.time()
+
         try:
             req = urllib.request.Request(self.api_url, method="POST")
             req.add_header("Content-Type", "application/json")
@@ -96,43 +99,57 @@ Device list:
 
             with urllib.request.urlopen(req, data=data, timeout=180) as response:
                 result = json.loads(response.read().decode("utf-8"))
-                raw_reply = result["message"]["content"]
-                duration = round(time.time() - t0, 2)
-                valid, rejected = self._parse_and_validate(raw_reply, registry_summary)
-                return {
-                    "valid_findings": valid,
-                    "rejected_findings": rejected,
-                    "raw_reply": raw_reply,
-                    "duration_seconds": duration,
-                    "error": None
-                }
+
+            raw_reply = result["message"]["content"]
+            duration  = round(time.time() - t0, 2)
+
+            # Ollama returns token counts at the response root
+            prompt_tokens     = result.get("prompt_eval_count", 0)
+            completion_tokens = result.get("eval_count", 0)
+            tokens = {
+                "prompt_tokens":     prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens":      prompt_tokens + completion_tokens,
+            }
+
+            valid, rejected = self._parse_and_validate(raw_reply, registry_summary)
+            return {
+                "valid_findings":    valid,
+                "rejected_findings": rejected,
+                "raw_reply":         raw_reply,
+                "tokens":            tokens,
+                "duration_seconds":  duration,
+                "error":             None,
+            }
 
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
-            msg = f"Ollama HTTP {e.code}: {body}"
+            msg  = f"Ollama HTTP {e.code}: {body}"
             logging.error(msg)
-            return self._error_result(msg, time.time() - t0)
+            return self._error_result(msg, time.time() - t0, empty_tokens)
 
         except urllib.error.URLError as e:
             msg = f"Failed to connect to Ollama: {e}"
             logging.error(msg)
-            return self._error_result(msg, time.time() - t0)
+            return self._error_result(msg, time.time() - t0, empty_tokens)
 
         except Exception as e:
             msg = f"Unexpected error: {e}"
             logging.error(msg)
-            return self._error_result(msg, time.time() - t0)
+            return self._error_result(msg, time.time() - t0, empty_tokens)
 
-    def _error_result(self, msg: str, elapsed: float) -> dict:
+    def _error_result(self, msg: str, elapsed: float, tokens: dict) -> dict:
         return {
-            "valid_findings": [],
+            "valid_findings":    [],
             "rejected_findings": [],
-            "raw_reply": "",
-            "duration_seconds": round(elapsed, 2),
-            "error": msg
+            "raw_reply":         "",
+            "tokens":            tokens,
+            "duration_seconds":  round(elapsed, 2),
+            "error":             msg,
         }
 
-    def _parse_and_validate(self, raw_reply: str, registry_summary: list) -> tuple[list, list]:
+    def _parse_and_validate(self, raw_reply: str,
+                             registry_summary: list) -> tuple:
         """Returns (valid_findings, rejected_findings)."""
         findings = []
 
@@ -176,9 +193,11 @@ Device list:
             logging.error(f"Auditor returned unparseable output. Raw: {raw_reply[:300]}")
             return [], []
 
-        valid_findings = []
+        valid_findings    = []
         rejected_findings = []
-        known_devices = {d["device_id"].replace(":", "").lower() for d in registry_summary}
+        known_devices = {
+            d["device_id"].replace(":", "").lower() for d in registry_summary
+        }
 
         for f in findings:
             # Normalize article value
@@ -187,23 +206,26 @@ Device list:
                 article = article.replace("ARTICLE ", "").strip()
             f["article"] = article
 
-            device_id = f.get("device_id", "")
-            suspicion = f.get("suspicion_level")
+            device_id            = f.get("device_id", "")
+            suspicion            = f.get("suspicion_level")
             device_id_normalized = device_id.replace(":", "").lower()
 
             if article not in self.valid_articles:
-                rejected_findings.append({"finding": f, "reason": f"Invalid article: {article}"})
+                rejected_findings.append(
+                    {"finding": f, "reason": f"Invalid article: {article}"}
+                )
                 logging.warning(f"Rejected finding: Invalid article {article}")
-                continue
-            if device_id_normalized not in known_devices:
-                rejected_findings.append({"finding": f, "reason": f"Hallucinated device_id: {device_id}"})
+            elif device_id_normalized not in known_devices:
+                rejected_findings.append(
+                    {"finding": f, "reason": f"Hallucinated device_id: {device_id}"}
+                )
                 logging.warning(f"Rejected finding: Hallucinated device_id {device_id}")
-                continue
-            if suspicion not in self.valid_suspicions:
-                rejected_findings.append({"finding": f, "reason": f"Invalid suspicion_level: {suspicion}"})
+            elif suspicion not in self.valid_suspicions:
+                rejected_findings.append(
+                    {"finding": f, "reason": f"Invalid suspicion_level: {suspicion}"}
+                )
                 logging.warning(f"Rejected finding: Invalid suspicion_level {suspicion}")
-                continue
-
-            valid_findings.append(f)
+            else:
+                valid_findings.append(f)
 
         return valid_findings, rejected_findings
