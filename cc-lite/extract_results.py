@@ -181,6 +181,9 @@ def extract_research_json(file_path: str, condition: str, ground_truth) -> tuple
         "total_rejected_findings": summary.get("total_rejected_findings", ""),
         "total_errors":            summary.get("total_errors", ""),
         "total_inference_seconds": summary.get("total_inference_seconds", ""),
+        "cpu_temp_min_c":          summary.get("cpu_temp_min_c", ""),
+        "cpu_temp_max_c":          summary.get("cpu_temp_max_c", ""),
+        "cpu_temp_mean_c":         summary.get("cpu_temp_mean_c", ""),
         # Token counts
         "total_prompt_tokens":     summary.get("total_prompt_tokens", ""),
         "total_completion_tokens": summary.get("total_completion_tokens", ""),

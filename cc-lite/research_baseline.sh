@@ -22,6 +22,18 @@ for ((i=1; i<=$1; i++)); do
     
     echo "=== CYCLE $i COMPLETE. Duration: ${ELAPSED}s ===" | tee -a "$LOG_FILE"
     
+    # Capture current CPU Package Temp
+    CPU_TEMP=$(cat /sys/class/thermal/thermal_zone8/temp)
+    CPU_C=$((CPU_TEMP / 1000))
+
+    echo "Current Substrate Temp: ${CPU_C}°C"
+
+    # Example: If temp is too high, double the sleep time
+    if [ $CPU_C -gt 75 ]; then
+        echo "Warning: Thermal Saturation detected. Increasing rest period."
+        sleep $(( $2 * 2 ))
+    fi
+
     if [ $i -lt $1 ]; then
         echo "Dissipating heat for $2 seconds..."
         sleep $2

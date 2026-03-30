@@ -108,7 +108,7 @@ class CensusTaker:
 # ---------------------------------------------------------------------------
 def _read_cpu_temp() -> float | None:
     try:
-        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+        with open("/sys/class/thermal/thermal_zone8/temp", "r") as f:
             val = round(int(f.read().strip()) / 1000, 1)
             print(f"DEBUG cpu_temp: {val}", file=sys.stderr)
             return val
