@@ -311,7 +311,7 @@ SESSION_FIELDS = [
     "device_count", "mdns_responses",
     # Run summary
     "total_batches", "total_valid_findings", "total_rejected_findings",
-    "total_errors", "total_inference_seconds",
+    "total_errors", "total_inference_seconds", "cpu_temp_min_c", "cpu_temp_max_c", "cpu_temp_mean_c",
     # Tokens
     "total_prompt_tokens", "total_completion_tokens", "total_tokens",
     # Efficiency

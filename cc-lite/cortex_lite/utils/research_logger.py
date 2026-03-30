@@ -43,38 +43,55 @@ def write_research_log(
     Writes a per-session research JSON log.
 
     batches: list of dicts returned by AuditorGeneral.audit(), each augmented
-             with 'batch_index' and 'batch_device_count' by the caller.
-             Each batch dict must include a 'tokens' key with:
-               prompt_tokens, completion_tokens, total_tokens
+             by main.py with:
+               - batch_index
+               - batch_device_count
+               - cpu_temp_c       (float | None)
+             and containing from the auditor:
+               - tokens           (dict: prompt_tokens, completion_tokens, total_tokens)
+               - duration_seconds (float)
+               - valid_findings, rejected_findings, raw_reply, error
 
     Returns the path of the written file.
     """
     os.makedirs(output_dir, exist_ok=True)
 
     ts_safe = timestamp.replace(":", "-").replace(" ", "_")[:19]
-    path = os.path.join(output_dir, f"research_{ts_safe}.json")
+    path    = os.path.join(output_dir, f"research_{ts_safe}.json")
 
+    # --- Rollup calculations -------------------------------------------------
+
+    total_valid      = len(all_findings)
     total_rejected   = sum(len(b.get("rejected_findings", [])) for b in batches)
     total_errors     = sum(1 for b in batches if b.get("error"))
     total_duration   = round(sum(b.get("duration_seconds", 0) for b in batches), 2)
-    total_valid      = len(all_findings)
 
-    # Token rollup across batches
     total_prompt     = sum(b.get("tokens", {}).get("prompt_tokens", 0)     for b in batches)
     total_completion = sum(b.get("tokens", {}).get("completion_tokens", 0) for b in batches)
     total_tokens     = total_prompt + total_completion
 
-    # Efficiency metrics — None when there are no findings to divide by
+    total_attempted  = total_valid + total_rejected
+
     tokens_per_finding = (
         round(total_tokens / total_valid, 1) if total_valid > 0 else None
     )
     seconds_per_finding = (
         round(total_duration / total_valid, 2) if total_valid > 0 else None
     )
-    total_attempted = total_valid + total_rejected
     rejection_rate = (
         round(total_rejected / total_attempted, 3) if total_attempted > 0 else None
     )
+
+    # --- Thermal summary from per-batch readings ----------------------------
+
+    temps = [b.get("cpu_temp_c") for b in batches if b.get("cpu_temp_c") is not None]
+    thermal_summary = {
+        "cpu_temp_min_c":  round(min(temps), 1)             if temps else None,
+        "cpu_temp_max_c":  round(max(temps), 1)             if temps else None,
+        "cpu_temp_mean_c": round(sum(temps) / len(temps), 1) if temps else None,
+    }
+
+    # --- Build record -------------------------------------------------------
 
     record = {
         "session_id": session_id,
@@ -106,6 +123,8 @@ def write_research_log(
             "tokens_per_finding":      tokens_per_finding,
             "seconds_per_finding":     seconds_per_finding,
             "rejection_rate":          rejection_rate,
+            # Thermal summary
+            **thermal_summary,
         },
         "batches":        batches,
         "valid_findings": all_findings,
@@ -132,6 +151,8 @@ def write_summary_file(
     total_tokens: int = 0,
     tokens_per_finding: float = None,
     seconds_per_finding: float = None,
+    cpu_temp_min_c: float = None,
+    cpu_temp_max_c: float = None,
     output_dir: str = "audit/summary"
 ) -> str:
     """
@@ -141,7 +162,7 @@ def write_summary_file(
     os.makedirs(output_dir, exist_ok=True)
 
     ts_safe = timestamp.replace(":", "-").replace(" ", "_")[:19]
-    path = os.path.join(output_dir, f"summary_{ts_safe}.txt")
+    path    = os.path.join(output_dir, f"summary_{ts_safe}.txt")
 
     lines = [
         "=" * 60,
@@ -161,6 +182,10 @@ def write_summary_file(
         if seconds_per_finding is not None:
             eff_parts.append(f"{seconds_per_finding}s per finding")
         lines.append(" | ".join(eff_parts))
+
+    # Thermal line — only shown when temperature data is available
+    if cpu_temp_min_c is not None and cpu_temp_max_c is not None:
+        lines.append(f"Thermal  : {cpu_temp_min_c}°C min / {cpu_temp_max_c}°C max")
 
     lines += ["=" * 60, ""]
 

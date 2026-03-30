@@ -103,6 +103,18 @@ class CensusTaker:
             p.wait()
         os.system("sleep 2")
 
+# ---------------------------------------------------------------------------
+# Read CPU temp just before inference — best proxy for throttle state
+# ---------------------------------------------------------------------------
+def _read_cpu_temp() -> float | None:
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            val = round(int(f.read().strip()) / 1000, 1)
+            print(f"DEBUG cpu_temp: {val}", file=sys.stderr)
+            return val
+    except Exception as e:
+        print(f"DEBUG cpu_temp error: {e}", file=sys.stderr)
+        return None
 
 # ---------------------------------------------------------------------------
 # Main
@@ -170,6 +182,8 @@ def main():
 
             try:
                 time.sleep(1)
+                t_start = time.time()
+                cpu_temp = _read_cpu_temp()
                 with Spinner(msg):
                     result = auditor_instance.audit(
                         batch,
@@ -180,6 +194,7 @@ def main():
                 # Augment result with batch metadata for research log
                 result["batch_index"]        = batch_num
                 result["batch_device_count"] = len(batch)
+                result["cpu_temp_c"] = cpu_temp
                 batch_records.append(result)
 
                 if result["error"]:
@@ -231,6 +246,14 @@ def main():
         summary_path = write_summary_file(
             session_id=current_session,
             timestamp=session_timestamp,
+            cpu_temp_min_c=min(
+                (b.get("cpu_temp_c") for b in batch_records
+                 if b.get("cpu_temp_c") is not None), default=None
+            ),
+            cpu_temp_max_c=max(
+                (b.get("cpu_temp_c") for b in batch_records
+                 if b.get("cpu_temp_c") is not None), default=None
+            ),
             device_count=len(raw_devices),
             mdns_count=len(mdns_data),
             all_findings=all_findings,
