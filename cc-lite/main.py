@@ -167,7 +167,7 @@ def main():
                 confidence = "none"
 
             registry_summary.append({
-                "device_id": d['mac'].replace(':', ''),
+                "device_id": d['mac'].replace(':', '') if d.get('mac') else None,
                 "ip": d['ip'],
                 "mac": d['mac'],
                 "vendor": vendor,
