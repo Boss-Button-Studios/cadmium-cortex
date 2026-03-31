@@ -14,7 +14,7 @@ class AuditorGeneral:
         self.valid_articles = {"I", "II", "III", "IV", "V"}
         self.valid_suspicions = {"low", "medium", "high"}
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, admin_id: str) -> str:
         return f"""You are the Auditor General for a constitutional network governance system.
 Your sole function is to evaluate network observations against the following
 constitutional articles and identify potential violations.
@@ -49,6 +49,10 @@ Explicit constraints — apply strictly:
   issue Article V findings based on device classification uncertainty.
 - Never file a finding against the Admin device MAC unless it is actively
   being impersonated by another device.
+- A device with oui_confidence "none" has a locally administered (randomized) MAC.
+  Do not classify it as IoT based on OUI. Suspicion level must not exceed "low"
+  for such devices unless behavioral evidence independently supports a higher level.
+- The Admin device ({admin_id}) must never appear in findings under any article.
 
 Do not issue findings for devices with insufficient evidence.
 Do not upgrade suspicion level beyond what the evidence supports.
@@ -78,7 +82,7 @@ Device list:
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": self._build_system_prompt()},
+                {"role": "system", "content": self._build_system_prompt(admin_id)},
                 {"role": "user",   "content": user_prompt}
             ],
             "stream": False,
