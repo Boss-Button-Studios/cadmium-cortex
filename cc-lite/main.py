@@ -14,6 +14,7 @@ from cortex_lite.auditor.constitution_loader import load_constitution
 from cortex_lite.auditor.auditor_general import AuditorGeneral
 from cortex_lite.utils.reporter import summarize_session
 from cortex_lite.utils.research_logger import write_research_log, write_summary_file
+from cortex_lite.census.oui_lookup import OUILookup
 
 # --- CONFIGURATION ---
 CONFIG = {
@@ -135,12 +136,16 @@ def main():
         const_text = load_constitution()
         print(ct.paint("[-] Constitution loaded and versioned.", ct.GREEN))
 
-        # 2. mDNS
+        # 2. Load OUI database once — 3.6MB CSV, don't reload per batch
+        oui_db = OUILookup(csv_path="data/oui.csv")
+        print(ct.paint(f"[-] OUI database loaded ({len(oui_db.registry)} entries).", ct.GREEN))
+
+        # 3. mDNS
         print(ct.paint("[*] Running mDNS scan...", ct.YELLOW))
         mdns_data = mdns_scan(listen_seconds=10)
         print(ct.paint(f"[-] mDNS returned {len(mdns_data)} device(s).", ct.GREEN))
 
-        # 3. ARP census — conditional sweep
+        # 4. ARP census — conditional sweep
         raw_devices = get_arp_table(interface=census.interface)
         if len(raw_devices) < CONFIG.get("min_devices", 10):
             print(ct.paint("[*] Sparse ARP cache — running active survey...", ct.YELLOW))
@@ -148,20 +153,31 @@ def main():
             raw_devices = get_arp_table(interface=census.interface)
         print(ct.paint(f"[-] Census captured {len(raw_devices)} devices.", ct.GREEN))
 
-        # 4. Build enriched registry summary
+        # 5. Build enriched registry summary
         registry_summary = []
         for d in raw_devices:
             mdns_info = mdns_data.get(d['ip'], {})
+            vendor, confidence = oui_db.lookup(d['mac'])
+
+            # Detect locally administered (randomized) MACs
+            first_octet = int(d['mac'].replace(':', '').replace('-', '')[0:2], 16)
+            locally_administered = bool(first_octet & 0x02)
+            if locally_administered:
+                vendor = "Unknown (randomized MAC)"
+                confidence = "none"
+
             registry_summary.append({
                 "device_id": d['mac'].replace(':', ''),
-                "ip":        d['ip'],
-                "mac":       d['mac'],
-                "vendor":    "Unknown",
-                "hostname":  mdns_info.get("hostname"),
-                "services":  mdns_info.get("services", [])
+                "ip": d['ip'],
+                "mac": d['mac'],
+                "vendor": vendor,
+                "oui_confidence": confidence,
+                "locally_administered": locally_administered,
+                "hostname": mdns_info.get("hostname"),
+                "services": mdns_info.get("services", []),
             })
 
-        # 5. Judicial deliberation
+        # 6. Judicial deliberation
         auditor_instance = AuditorGeneral(CONFIG["model"], const_text)
         batch_size = CONFIG["batch_size"]
         total_batches = -(-len(registry_summary) // batch_size)  # ceiling division
@@ -218,7 +234,7 @@ def main():
                     "error":              str(e)
                 })
 
-        # 6. Log valid findings to JSONL
+        # 7. Log valid findings to JSONL
         for finding in all_findings:
             log_event(
                 event_type="accusation",
@@ -229,7 +245,7 @@ def main():
                 articles=[finding.get("article", "Unknown")]
             )
 
-        # 7. Write research log and enriched summary
+        # 8. Write research log and enriched summary
         total_rejected = sum(len(b.get("rejected_findings", [])) for b in batch_records)
         total_errors   = sum(1 for b in batch_records if b.get("error"))
 
