@@ -8,89 +8,129 @@ import time
 
 class AuditorGeneral:
     def __init__(self, model_name: str, constitution_text: str):
-        self.model = model_name
+        self.model        = model_name
         self.constitution = constitution_text
-        self.api_url = "http://localhost:11434/api/chat"
-        self.valid_articles = {"I", "II", "III", "IV", "V"}
+        self.api_url      = "http://localhost:11434/api/chat"
+
+        # CC-Lite passive observation scope.
+        # Articles I and II require active enforcement context (Sheriff).
+        # They cannot be triggered by passive observation and are excluded
+        # at the architecture level, not just by prompt constraint.
+        self.valid_articles   = {"III", "IV"}
         self.valid_suspicions = {"low", "medium", "high"}
 
-    def _build_system_prompt(self, admin_id: str) -> str:
-        return f"""You are the Auditor General for a constitutional network governance system.
-Your sole function is to evaluate network observations against the following
-constitutional articles and identify potential violations.
+    # -----------------------------------------------------------------------
+    # Prompt v5
+    # -----------------------------------------------------------------------
 
-You must return a JSON object with a single key "findings" containing an array.
-Each finding in the array must include:
-- article: the article number — must be a quoted JSON string: "I", "II", "III", "IV",
-  or "V". Never a bare value, never prefixed with "Article".
-- device_id: the device identifier from the observation
-- suspicion_level: one of [low, medium, high]
-- evidence: a one-sentence description of what you observed
-- reasoning: a one-sentence explanation of why this may violate the article
+    def _build_system_prompt(self) -> str:
+        return f"""You are the Auditor General for a constitutional network governance system
+operating in passive observation mode.
 
-suspicion_level rules:
-- high: IoT-classified device observed communicating with a non-gateway
-  MAC on the same L2 segment that is classified as a private asset
-- medium: IoT-classified device present on same L2 as private assets,
-  with RFC1918 destination that is not the known gateway
-- low: Device classification is uncertain but warrants monitoring
+Your jurisdiction covers two articles only:
+  Article III — SILENCE: devices with unknown or unresolvable identity
+  Article IV  — ISOLATION: IoT devices not isolated from the Private segment
 
-Explicit constraints — apply strictly:
-- Article I applies ONLY when an action would directly sever the Administrator's
-  connection to the network. A device merely being present or unknown is NOT
-  an Article I violation. The Admin device itself is never a violation.
-- Article II applies ONLY when a private asset's path to the Gateway is blocked
-  or interrupted. IoT devices on the L2 segment are Article IV, not Article II.
-- Article III applies to devices with unknown or unresolvable OUI. Do not
-  escalate Article III findings to other articles.
-- Article IV applies to IoT-classified devices present on or communicating
-  with the Private VLAN. This is the correct article for isolation violations.
-- Article V applies only when audit logging is demonstrably absent. Do not
-  issue Article V findings based on device classification uncertainty.
-- Never file a finding against the Admin device MAC unless it is actively
-  being impersonated by another device.
-- A device with oui_confidence "none" has a locally administered (randomized) MAC.
-  Do not classify it as IoT based on OUI. Suspicion level must not exceed "low"
-  for such devices unless behavioral evidence independently supports a higher level.
-- The Admin device ({admin_id}) must never appear in findings under any article.
+You have NO jurisdiction over Articles I, II, or V in passive observation mode.
+Do not file findings under those articles under any circumstances.
 
-Do not issue findings for devices with insufficient evidence.
-Do not upgrade suspicion level beyond what the evidence supports.
+--- DEVICE CLASSIFICATION ---
+
+Each device in the observation has a pre-computed classification:
+  Infrastructure — gateway, WAPs, switches. NOT a finding target.
+  Admin          — the administrator's device. NOT a finding target.
+  IoT            — smart home devices, cameras, appliances. Article IV scope.
+  Unknown-Random — randomized MAC (locally_administered: true). Article III only,
+                   suspicion never above "low".
+  Unknown        — unresolvable OUI, no identifying signals. Article III scope.
+  Private        — laptops, phones, NAS. NOT a finding target in passive mode.
+
+Only IoT, Unknown-Random, and Unknown devices may appear in findings.
+If a device is classified Infrastructure, Admin, or Private — skip it entirely.
+
+--- ARTICLE DECISION RULES ---
+
+Article IV — file when:
+  - device_class is "IoT"
+  - AND the device is present on the same L2 segment as private assets
+  Suspicion levels:
+    high:   IoT device observed communicating with a non-gateway RFC1918 address
+    medium: IoT device present on Private L2 with any RFC1918 destination
+    low:    IoT device present on Private L2, destination uncertain
+
+Article III — file when:
+  - device_class is "Unknown" or "Unknown-Random"
+  - AND the device appears to be initiating peer-to-peer sessions
+  Suspicion levels:
+    high:   Unknown device communicating with multiple private assets
+    medium: Unknown device with RFC1918 destination that is not the gateway
+    low:    Unknown device present, classification uncertain
+  Hard constraint: Unknown-Random devices never exceed "low" suspicion.
+
+--- OUTPUT FORMAT ---
+
+Return a JSON object with a single key "findings" containing an array.
+Each finding must include:
+  - article:         "III" or "IV" — a quoted string, never bare
+  - device_id:       the device_id from the observation
+  - suspicion_level: "low", "medium", or "high"
+  - evidence:        one sentence describing what was observed
+  - reasoning:       one sentence explaining the constitutional basis
+
 If no violations are found, return {{"findings": []}}.
+Do not include findings for Infrastructure, Admin, or Private devices.
+Do not include findings under Articles I, II, or V.
 
-CONSTITUTIONAL ARTICLES:
+CONSTITUTIONAL ARTICLES (reference only — your jurisdiction is III and IV):
 {self.constitution}"""
 
-    def audit(self, registry_summary: list, gateway_ip: str, admin_id: str) -> dict:
+    # -----------------------------------------------------------------------
+    # Audit
+    # -----------------------------------------------------------------------
+
+    def audit(self, dossiers: list, gateway_ip: str, admin_id: str) -> dict:
         """
+        Run a constitutional audit on a batch of device dossiers.
+
+        Parameters
+        ----------
+        dossiers   : list of dicts (DeviceDossier.to_dict()) — pre-classified
+        gateway_ip : gateway IP address
+        admin_id   : admin MAC address (excluded from findings in user prompt)
+
         Returns a dict containing:
           - valid_findings:     list of validated finding dicts
           - rejected_findings:  list of dicts with 'finding' and 'reason'
-          - raw_reply:          the raw string from the model
+          - raw_reply:          raw model output string
           - tokens:             dict with prompt_tokens, completion_tokens, total_tokens
           - duration_seconds:   float
           - error:              string or None
         """
-        user_prompt = f"""Network observation summary:
-- Gateway IP: {gateway_ip}
-- Admin device MAC hash: {admin_id}
-- Observed devices: {len(registry_summary)}
+        # Admin and gateway exclusions stated explicitly in user prompt
+        # so the model sees them right next to the device list
+        user_prompt = f"""EXCLUDED FROM ALL FINDINGS — do not file under any article:
+  - {admin_id} (Administrator device)
+  - {gateway_ip} (Gateway — infrastructure, not a violation target)
 
-Device list:
-{json.dumps(registry_summary, indent=2)}
+Network observation:
+  Gateway IP     : {gateway_ip}
+  Devices observed: {len(dossiers)}
+
+Device dossiers:
+{json.dumps(dossiers, indent=2)}
 """
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": self._build_system_prompt(admin_id)},
-                {"role": "user",   "content": user_prompt}
+                {"role": "system", "content": self._build_system_prompt()},
+                {"role": "user",   "content": user_prompt},
             ],
             "stream": False,
             "options": {
                 "num_ctx":     2048,
                 "num_gpu":     0,
-                "temperature": 0.2
-            }
+                "temperature": 0.2,
+            },
         }
 
         empty_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -107,7 +147,6 @@ Device list:
             raw_reply = result["message"]["content"]
             duration  = round(time.time() - t0, 2)
 
-            # Ollama returns token counts at the response root
             prompt_tokens     = result.get("prompt_eval_count", 0)
             completion_tokens = result.get("eval_count", 0)
             tokens = {
@@ -116,7 +155,7 @@ Device list:
                 "total_tokens":      prompt_tokens + completion_tokens,
             }
 
-            valid, rejected = self._parse_and_validate(raw_reply, registry_summary)
+            valid, rejected = self._parse_and_validate(raw_reply, dossiers)
             return {
                 "valid_findings":    valid,
                 "rejected_findings": rejected,
@@ -152,8 +191,11 @@ Device list:
             "error":             msg,
         }
 
-    def _parse_and_validate(self, raw_reply: str,
-                             registry_summary: list) -> tuple:
+    # -----------------------------------------------------------------------
+    # Parse and validate
+    # -----------------------------------------------------------------------
+
+    def _parse_and_validate(self, raw_reply: str, dossiers: list) -> tuple:
         """Returns (valid_findings, rejected_findings)."""
         findings = []
 
@@ -163,7 +205,7 @@ Device list:
             clean = re.sub(r'\n?```.*$', '', clean, flags=re.MULTILINE)
             clean = clean.strip()
 
-        # Try 1: valid JSON object with "findings" key
+        # Try 1: JSON object with "findings" key
         try:
             parsed = json.loads(clean)
             if isinstance(parsed, dict) and "findings" in parsed:
@@ -199,36 +241,41 @@ Device list:
 
         valid_findings    = []
         rejected_findings = []
+
         known_devices = {
-            d["device_id"].replace(":", "").lower() for d in registry_summary
+            d["device_id"].replace(":", "").lower()
+            for d in dossiers
+            if d.get("device_id") is not None
         }
 
         for f in findings:
-            # Normalize article value
-            article = f.get("article", "").strip().upper()
-            if article.startswith("ARTICLE "):
-                article = article.replace("ARTICLE ", "").strip()
+            # Normalize article
+            article = f.get("article", "")
+            if isinstance(article, str):
+                article = article.strip().upper()
+                if article.startswith("ARTICLE "):
+                    article = article.replace("ARTICLE ", "").strip()
             f["article"] = article
 
-            device_id            = f.get("device_id", "")
+            device_id            = f.get("device_id", "") or ""
             suspicion            = f.get("suspicion_level")
             device_id_normalized = device_id.replace(":", "").lower()
 
             if article not in self.valid_articles:
                 rejected_findings.append(
-                    {"finding": f, "reason": f"Invalid article: {article}"}
+                    {"finding": f, "reason": f"Out-of-scope article: {article}"}
                 )
-                logging.warning(f"Rejected finding: Invalid article {article}")
+                logging.warning(f"Rejected finding: out-of-scope article {article}")
             elif device_id_normalized not in known_devices:
                 rejected_findings.append(
                     {"finding": f, "reason": f"Hallucinated device_id: {device_id}"}
                 )
-                logging.warning(f"Rejected finding: Hallucinated device_id {device_id}")
+                logging.warning(f"Rejected finding: hallucinated device_id {device_id}")
             elif suspicion not in self.valid_suspicions:
                 rejected_findings.append(
                     {"finding": f, "reason": f"Invalid suspicion_level: {suspicion}"}
                 )
-                logging.warning(f"Rejected finding: Invalid suspicion_level {suspicion}")
+                logging.warning(f"Rejected finding: invalid suspicion_level {suspicion}")
             else:
                 valid_findings.append(f)
 

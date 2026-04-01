@@ -10,93 +10,106 @@ from datetime import datetime, timezone
 from cortex_lite.config import CadmiumTheme as ct
 from cortex_lite.census.arp_reader import get_arp_table
 from cortex_lite.census.mdns_listener import scan as mdns_scan
+from cortex_lite.census.oui_lookup import OUILookup
+from cortex_lite.census.census_agent import build_dossiers, load_router_labels
 from cortex_lite.auditor.constitution_loader import load_constitution
 from cortex_lite.auditor.auditor_general import AuditorGeneral
 from cortex_lite.utils.reporter import summarize_session
 from cortex_lite.utils.research_logger import write_research_log, write_summary_file
-from cortex_lite.census.oui_lookup import OUILookup
 
 # --- CONFIGURATION ---
 CONFIG = {
-    "admin_mac":   "90:09:d0:51:ed:f0",
-    "gateway_ip":  "192.168.0.1",
-    "auditor_ip":  "192.168.0.5",
-    "model":       "llama3.2:3b",
-    "log_path":    "audit/audit.jsonl",
-    "batch_size":  4,
-    "min_devices": 10
+    "admin_mac":      "90:09:d0:51:ed:f0",
+    "gateway_ip":     "192.168.0.1",
+    "model":          "llama3.2:3b",
+    "log_path":       "audit/audit.jsonl",
+    "batch_size":     4,
+    "num_gpu":        0,
+    "temperature":    0.2,
+    "num_ctx":        2048,
+    "oui_txt_path":   "data/oui.txt",
+    "oui_csv_path":   "data/oui.csv",
+    "router_labels":  "data/known_devices.csv",  # optional — skipped if absent
 }
 
 
-# ---------------------------------------------------------------------------
-# Spinner
-# ---------------------------------------------------------------------------
+# --- SPINNER -----------------------------------------------------------------
 
 class Spinner:
     def __init__(self, message):
-        self.message = message
-        self._spinning = False
-        self._thread = None
+        self.message  = message
+        self._running = False
+        self._thread  = None
 
     def __enter__(self):
-        self._spinning = True
-        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._running = True
+        self._thread  = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
         return self
 
     def __exit__(self, *args):
-        self._spinning = False
+        self._running = False
         self._thread.join()
         sys.stderr.write('\r' + ' ' * (len(self.message) + 4) + '\r')
         sys.stderr.flush()
 
     def _spin(self):
         for char in itertools.cycle('|/-\\'):
-            if not self._spinning:
+            if not self._running:
                 break
             sys.stderr.write(f'\r{self.message} {char}')
             sys.stderr.flush()
             time.sleep(0.1)
 
 
-# ---------------------------------------------------------------------------
-# Audit log
-# ---------------------------------------------------------------------------
+# --- THERMAL -----------------------------------------------------------------
+
+def _read_cpu_temp() -> float | None:
+    for zone in ["thermal_zone8", "thermal_zone1", "thermal_zone0"]:
+        try:
+            with open(f"/sys/class/thermal/{zone}/temp", "r") as f:
+                candidate = round(int(f.read().strip()) / 1000, 1)
+            if candidate > 30.0:
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+# --- LOGGING -----------------------------------------------------------------
 
 def log_event(event_type, agent, branch, payload, session_id, articles=None):
-    """Writes a Section 9 compliant record to the JSONL log."""
+    """Writes a Section 9 compliant record to the JSONL audit log."""
     record = {
-        "event_id":        str(uuid.uuid4()),
-        "timestamp":       datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "agent":           agent,
-        "branch":          branch,
-        "event_type":      event_type,
-        "session_id":      session_id,
+        "event_id":         str(uuid.uuid4()),
+        "timestamp":        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "agent":            agent,
+        "branch":           branch,
+        "event_type":       event_type,
+        "session_id":       session_id,
         "articles_touched": articles or [],
-        "payload":         payload
+        "payload":          payload,
     }
     os.makedirs(os.path.dirname(CONFIG["log_path"]), exist_ok=True)
     with open(CONFIG["log_path"], "a") as f:
         f.write(json.dumps(record) + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Census
-# ---------------------------------------------------------------------------
+# --- CENSUS ------------------------------------------------------------------
 
 class CensusTaker:
     def __init__(self, interface="wlp3s0", gateway_ip="192.168.0.1"):
-        self.interface = interface
+        self.interface  = interface
         self.gateway_ip = gateway_ip
 
     def active_survey(self):
-        print(ct.paint("[*] Surveying building-to-building bridge...", ct.YELLOW))
-        subnet = ".".join(self.gateway_ip.split('.')[:-1])
+        """Ping sweep to populate ARP cache."""
+        print(ct.paint("[*] Surveying network...", ct.YELLOW))
+        subnet    = ".".join(self.gateway_ip.split('.')[:-1])
         processes = []
         for i in range(1, 255):
-            target = f"{subnet}.{i}"
             p = subprocess.Popen(
-                ["ping", "-c", "1", "-W", "1", target],
+                ["ping", "-c", "1", "-W", "1", f"{subnet}.{i}"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             processes.append(p)
@@ -104,26 +117,36 @@ class CensusTaker:
             p.wait()
         os.system("sleep 2")
 
-# ---------------------------------------------------------------------------
-# Read CPU temp just before inference — best proxy for throttle state
-# ---------------------------------------------------------------------------
-def _read_cpu_temp() -> float | None:
-    try:
-        with open("/sys/class/thermal/thermal_zone8/temp", "r") as f:
-            val = round(int(f.read().strip()) / 1000, 1)
-            print(f"DEBUG cpu_temp: {val}", file=sys.stderr)
-            return val
-    except Exception as e:
-        print(f"DEBUG cpu_temp error: {e}", file=sys.stderr)
-        return None
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# --- HARDWARE CONTEXT --------------------------------------------------------
+
+def get_hardware_context() -> dict:
+    import platform
+    context = {
+        "platform":         platform.system(),
+        "platform_version": platform.version(),
+        "python_version":   platform.python_version(),
+        "cpu_cores":        os.cpu_count(),
+        "ram_gb":           None,
+    }
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    context["ram_gb"] = round(kb / (1024 ** 2), 1)
+                    break
+    except Exception:
+        pass
+    return context
+
+
+# --- MAIN --------------------------------------------------------------------
 
 def main():
-    current_session = str(uuid.uuid4())
+    current_session   = str(uuid.uuid4())
     session_timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    hardware          = get_hardware_context()
 
     print(ct.paint(f"\n{ct.BOLD}CADMIUM CORTEX -- Constitutional Audit", ct.BLUE))
     print(ct.paint(f"Session: {current_session}\n", ct.BLUE))
@@ -136,159 +159,197 @@ def main():
         const_text = load_constitution()
         print(ct.paint("[-] Constitution loaded and versioned.", ct.GREEN))
 
-        # 2. Load OUI database once — 3.6MB CSV, don't reload per batch
-        oui_db = OUILookup(csv_path="data/oui.csv")
-        print(ct.paint(f"[-] OUI database loaded ({len(oui_db.registry)} entries).", ct.GREEN))
+        # 2. OUI database
+        oui_db = OUILookup(
+            csv_path=CONFIG["oui_csv_path"],
+            txt_path=CONFIG["oui_txt_path"],
+        )
+        print(ct.paint(
+            f"[-] OUI database loaded ({len(oui_db.registry)} entries).", ct.GREEN
+        ))
 
-        # 3. mDNS
+        # 3. Router labels (optional)
+        router_labels = load_router_labels(CONFIG["router_labels"])
+        if router_labels:
+            print(ct.paint(
+                f"[-] Router labels loaded ({len(router_labels)} entries).", ct.GREEN
+            ))
+
+        # 4. mDNS scan
         print(ct.paint("[*] Running mDNS scan...", ct.YELLOW))
         mdns_data = mdns_scan(listen_seconds=10)
         print(ct.paint(f"[-] mDNS returned {len(mdns_data)} device(s).", ct.GREEN))
 
-        # 4. ARP census — conditional sweep
+        # 5. ARP census
         raw_devices = get_arp_table(interface=census.interface)
-        if len(raw_devices) < CONFIG.get("min_devices", 10):
-            print(ct.paint("[*] Sparse ARP cache — running active survey...", ct.YELLOW))
-            census.active_survey()
-            raw_devices = get_arp_table(interface=census.interface)
-        print(ct.paint(f"[-] Census captured {len(raw_devices)} devices.", ct.GREEN))
+        print(ct.paint(f"[-] ARP census: {len(raw_devices)} live device(s).", ct.GREEN))
 
-        # 5. Build enriched registry summary
-        registry_summary = []
-        for d in raw_devices:
-            mdns_info = mdns_data.get(d['ip'], {})
-            vendor, confidence = oui_db.lookup(d['mac'])
+        # 6. Build dossiers — deterministic classification before LLM sees anything
+        dossiers = build_dossiers(
+            arp_entries   = raw_devices,
+            mdns_data     = mdns_data,
+            oui_lookup    = oui_db,
+            admin_mac     = CONFIG["admin_mac"],
+            gateway_ip    = CONFIG["gateway_ip"],
+            router_labels = router_labels if router_labels else None,
+        )
 
-            # Detect locally administered (randomized) MACs
-            first_octet = int(d['mac'].replace(':', '').replace('-', '')[0:2], 16)
-            locally_administered = bool(first_octet & 0x02)
-            if locally_administered:
-                vendor = "Unknown (randomized MAC)"
-                confidence = "none"
+        # Print classification summary
+        from collections import Counter
+        class_counts = Counter(d.device_class for d in dossiers)
+        summary_str  = " | ".join(f"{cls}: {n}" for cls, n in sorted(class_counts.items()))
+        print(ct.paint(f"[-] Dossiers: {summary_str}", ct.GREEN))
 
-            registry_summary.append({
-                "device_id": d['mac'].replace(':', '') if d.get('mac') else None,
-                "ip": d['ip'],
-                "mac": d['mac'],
-                "vendor": vendor,
-                "oui_confidence": confidence,
-                "locally_administered": locally_administered,
-                "hostname": mdns_info.get("hostname"),
-                "services": mdns_info.get("services", []),
-            })
-
-        # 6. Judicial deliberation
-        auditor_instance = AuditorGeneral(CONFIG["model"], const_text)
-        batch_size = CONFIG["batch_size"]
-        total_batches = -(-len(registry_summary) // batch_size)  # ceiling division
-
+        # Only IoT, Unknown, and Unknown-Random go to the auditor
+        audit_targets = [
+            d.to_audit_dict() for d in dossiers
+            if d.device_class in {"IoT", "Unknown", "Unknown-Random"}
+        ]
         print(ct.paint(
-            f"[*] Auditor deliberating on {len(registry_summary)} devices...", ct.YELLOW
+            f"[*] Auditor scope: {len(audit_targets)} device(s) "
+            f"({len(dossiers) - len(audit_targets)} excluded by classification).",
+            ct.YELLOW
         ))
 
-        all_findings = []
-        batch_records = []   # for research log
+        census_meta = {
+            "device_count":    len(dossiers),
+            "mdns_responses":  len(mdns_data),
+            "audit_targets":   len(audit_targets),
+            "class_counts":    dict(class_counts),
+        }
 
-        for i in range(0, len(registry_summary), batch_size):
-            batch = registry_summary[i: i + batch_size]
-            batch_num = i // batch_size + 1
-            msg = ct.paint(
-                f"    > Batch {batch_num}/{total_batches} ({len(batch)} devices)", ct.YELLOW
-            )
+        # 7. Judicial deliberation — only on audit targets
+        auditor       = AuditorGeneral(CONFIG["model"], const_text)
+        batch_size    = CONFIG["batch_size"]
+        total_batches = max(1, -(-len(audit_targets) // batch_size))
 
-            try:
-                time.sleep(1)
-                t_start = time.time()
-                cpu_temp = _read_cpu_temp()
-                with Spinner(msg):
-                    result = auditor_instance.audit(
-                        batch,
-                        gateway_ip=CONFIG["gateway_ip"],
-                        admin_id=CONFIG["admin_mac"]
-                    )
+        if not audit_targets:
+            print(ct.paint("[+] No audit targets after classification. Clean network.", ct.GREEN))
+            batch_records = []
+            all_findings  = []
+        else:
+            print(ct.paint(
+                f"[*] Auditor deliberating on {len(audit_targets)} device(s)...",
+                ct.YELLOW
+            ))
 
-                # Augment result with batch metadata for research log
-                result["batch_index"]        = batch_num
-                result["batch_device_count"] = len(batch)
-                result["cpu_temp_c"] = cpu_temp
-                batch_records.append(result)
+            batch_records = []
+            all_findings  = []
 
-                if result["error"]:
-                    print(ct.paint(f"    [!] Batch {batch_num} failed: {result['error']}", ct.RED))
-                elif result["valid_findings"]:
-                    count = len(result["valid_findings"])
-                    print(ct.paint(f"      [+] {count} finding(s).", ct.GREEN))
-                    all_findings.extend(result["valid_findings"])
-                else:
-                    print(f"      [-] No violations.")
+            for i in range(0, len(audit_targets), batch_size):
+                batch     = audit_targets[i: i + batch_size]
+                batch_num = i // batch_size + 1
+                msg       = ct.paint(
+                    f"    > Batch {batch_num}/{total_batches} ({len(batch)} devices)",
+                    ct.YELLOW
+                )
 
-            except Exception as e:
-                print(ct.paint(f"    [!] Batch {batch_num} failed: {e}", ct.RED))
-                batch_records.append({
-                    "batch_index":        batch_num,
-                    "batch_device_count": len(batch),
-                    "valid_findings":     [],
-                    "rejected_findings":  [],
-                    "raw_reply":          "",
-                    "duration_seconds":   0,
-                    "error":              str(e)
-                })
+                try:
+                    time.sleep(1)
+                    cpu_temp = _read_cpu_temp()
+                    t_start  = time.time()
 
-        # 7. Log valid findings to JSONL
+                    with Spinner(msg):
+                        result = auditor.audit(
+                            dossiers   = batch,
+                            gateway_ip = CONFIG["gateway_ip"],
+                            admin_id   = CONFIG["admin_mac"],
+                        )
+
+                    duration = round(time.time() - t_start, 2)
+
+                    result["batch_index"]        = batch_num
+                    result["batch_device_count"] = len(batch)
+                    result["cpu_temp_c"]         = cpu_temp
+                    batch_records.append(result)
+
+                    if result["error"]:
+                        print(ct.paint(
+                            f"    [!] Batch {batch_num} error: {result['error']}", ct.RED
+                        ))
+                    elif result["valid_findings"]:
+                        count = len(result["valid_findings"])
+                        tok   = result["tokens"]
+                        print(ct.paint(
+                            f"      [+] {count} finding(s) | "
+                            f"{tok['prompt_tokens']}p + {tok['completion_tokens']}c "
+                            f"= {tok['total_tokens']} tokens",
+                            ct.GREEN
+                        ))
+                        all_findings.extend(result["valid_findings"])
+                    else:
+                        print(f"      [-] No violations.")
+
+                except Exception as e:
+                    print(ct.paint(f"    [!] Batch {batch_num} failed: {e}", ct.RED))
+                    batch_records.append({
+                        "batch_index":        batch_num,
+                        "batch_device_count": len(batch),
+                        "valid_findings":     [],
+                        "rejected_findings":  [],
+                        "raw_reply":          "",
+                        "tokens":             {"prompt_tokens": 0,
+                                               "completion_tokens": 0,
+                                               "total_tokens": 0},
+                        "duration_seconds":   0,
+                        "cpu_temp_c":         None,
+                        "error":              str(e),
+                    })
+
+        # 8. Log findings to audit JSONL
         for finding in all_findings:
             log_event(
-                event_type="accusation",
-                agent="auditor_general",
-                branch="judicial",
-                payload=finding,
-                session_id=current_session,
-                articles=[finding.get("article", "Unknown")]
+                event_type = "accusation",
+                agent      = "auditor_general",
+                branch     = "judicial",
+                payload    = finding,
+                session_id = current_session,
+                articles   = [finding.get("article", "Unknown")],
             )
 
-        # 8. Write research log and enriched summary
+        # 9. Write research log and summary
         total_rejected = sum(len(b.get("rejected_findings", [])) for b in batch_records)
         total_errors   = sum(1 for b in batch_records if b.get("error"))
+        total_tokens   = sum(b.get("tokens", {}).get("total_tokens", 0)
+                             for b in batch_records)
+        total_secs     = sum(b.get("duration_seconds", 0) for b in batch_records)
 
         research_path = write_research_log(
-            session_id=current_session,
-            timestamp=session_timestamp,
-            config=CONFIG,
-            mdns_count=len(mdns_data),
-            device_count=len(raw_devices),
-            batches=batch_records,
-            all_findings=all_findings
+            session_id   = current_session,
+            timestamp    = session_timestamp,
+            config       = CONFIG,
+            mdns_count   = len(mdns_data),
+            device_count = len(dossiers),
+            batches      = batch_records,
+            all_findings = all_findings,
         )
 
         summary_path = write_summary_file(
-            session_id=current_session,
-            timestamp=session_timestamp,
-            cpu_temp_min_c=min(
-                (b.get("cpu_temp_c") for b in batch_records
+            session_id          = current_session,
+            timestamp           = session_timestamp,
+            device_count        = len(dossiers),
+            mdns_count          = len(mdns_data),
+            all_findings        = all_findings,
+            rejected_count      = total_rejected,
+            error_count         = total_errors,
+            total_tokens        = total_tokens,
+            tokens_per_finding  = (
+                round(total_tokens / len(all_findings), 1)
+                if all_findings else None
+            ),
+            seconds_per_finding = (
+                round(total_secs / len(all_findings), 2)
+                if all_findings else None
+            ),
+            cpu_temp_min_c = min(
+                (b["cpu_temp_c"] for b in batch_records
                  if b.get("cpu_temp_c") is not None), default=None
             ),
-            cpu_temp_max_c=max(
-                (b.get("cpu_temp_c") for b in batch_records
+            cpu_temp_max_c = max(
+                (b["cpu_temp_c"] for b in batch_records
                  if b.get("cpu_temp_c") is not None), default=None
             ),
-            device_count=len(raw_devices),
-            mdns_count=len(mdns_data),
-            all_findings=all_findings,
-            rejected_count=total_rejected,
-            error_count=total_errors,
-            total_tokens=sum(
-                b.get("tokens", {}).get("total_tokens", 0) for b in batch_records
-        ),
-        tokens_per_finding=(
-            round(sum(b.get("tokens", {}).get("total_tokens", 0)
-                for b in batch_records) / len(all_findings), 1)
-            if all_findings else None
-        ),
-        seconds_per_finding=(
-            round(sum(b.get("duration_seconds", 0)
-            for b in batch_records) / len(all_findings), 2)
-            if all_findings else None
-        ),
-)
+        )
 
         print(ct.paint(f"[-] Research log: {research_path}", ct.GREEN))
         print(ct.paint(f"[-] Summary:      {summary_path}", ct.GREEN))
